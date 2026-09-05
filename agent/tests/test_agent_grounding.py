@@ -3371,3 +3371,47 @@ def test_attribution_exemption_cannot_launders_self_claims(tmp_path: Path) -> No
             answer,
             issues,
         )
+
+
+def test_generic_header_table_metric_rows_are_gated(tmp_path: Path) -> None:
+    """#1336 must not be dodgeable by formatting the claim as a generic-header
+    table (| 指标 | 数值 | / | Metric | Value |) with the metric kind in the
+    row instead of prose or a metric-headed table."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+
+    result = ledger.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---:|\n| 年化收益 | 18.2% |\n| 最大回撤 | -9.4% |"
+    )
+
+    assert result.valid is False, result.issues
+    assert [
+        i for i in result.issues if i.get("code") == "analysis_claim_unavailable"
+    ]
+
+
+def test_generic_header_table_accepts_value_backed_and_criterion_rows(
+    tmp_path: Path,
+) -> None:
+    """The generic-header fallback must still accept value-backed rows and must
+    not treat bounds/definitions as asserted values."""
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="回测策略")
+    ledger.ingest_tool_result(
+        tool_name="portfolio_risk_xray",
+        arguments={"symbols": ["AAPL"]},
+        result=json.dumps({"annualized_vol": 0.182, "max_drawdown": -0.094}),
+        call_id="x",
+        success=True,
+    )
+
+    # value-backed row accepted
+    assert ledger.validate_final_answer(
+        "| 指标 | 数值 |\n|---|---:|\n| 年化波动率 | 18.2% |"
+    ).valid is True
+    # criterion row (bound) accepted, not grabbed as a measured value
+    assert ledger.validate_final_answer(
+        "| 指标 | 标准 |\n|---|---|\n| 最大回撤 | 小于 -5% 触发风控 |"
+    ).valid is True
+    # definitional row accepted
+    assert ledger.validate_final_answer(
+        "| 指标 | 备注 |\n|---|---|\n| 夏普比率 | 通常大于1.0认为较好 |"
+    ).valid is True

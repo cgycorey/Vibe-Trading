@@ -351,6 +351,16 @@ _DEFINITION_FRAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A comparison/criterion marker means the number is a benchmark or bound
+# ("夏普比率 > 1.0 较好", "回撤小于 -5%"), not an asserted observed value.
+# The asserted-value gate (and in particular the generic-header table path)
+# must not grab "1.0" out of "通常大于1.0认为较好" as a claimed measurement.
+_COMPARISON_CRITERION_RE = re.compile(
+    r"(?:>=|<=|>|<|≥|≤|大于|小于|不低于|不高于|以上|以下|至少|至多|"
+    r"exceeds?|below|above|under|no\s+less\s+than)",
+    re.IGNORECASE,
+)
+
 # A categorical "all N-month windows were profitable" claim carries only an
 # integer window length, which _MEASURE_NUMBER_RE deliberately ignores; it is a
 # measured fact about the run and needs a window-producing analysis result.
@@ -2701,43 +2711,27 @@ class GroundingLedger:
                 (cell, _metric_kind_for_text(cell), bool(_FORECAST_FRAME_RE.search(cell)))
                 for cell in header
             ]
-            if not any(kind for _, kind, _ in columns):
-                continue
+            has_kind_header = any(kind for _, kind, _ in columns)
             for row in rows:
                 cells = row + [""] * (len(columns) - len(row))
+                if not has_kind_header:
+                    # Generic header ("指标 | 数值", "Metric | Value"): a row
+                    # whose first cell names a metric kind is a (label, value)
+                    # pair. Without this fallback the whole #1336 gate is
+                    # dodgeable by formatting the claim as a generic table
+                    # instead of prose or a metric-headed table.
+                    if not cells or not cells[0].strip():
+                        continue
+                    row_kind = _metric_kind_for_text(cells[0])
+                    if row_kind is None:
+                        continue
+                    for cell in cells[1:]:
+                        self._check_table_cell(cells[0], row_kind, cell, issues)
+                    continue
                 for (cell_text, kind, header_forecast), cell in zip(columns, cells):
                     if kind is None or header_forecast:
                         continue
-                    values = self._measure_numbers(cell)
-                    if not values:
-                        continue
-                    # A forecast annotation inside the cell ("预计 12.4%")
-                    # exempts only that cell, never its neighbours.
-                    if _FORECAST_FRAME_RE.search(cell) or _DEFINITION_FRAME_RE.search(
-                        cell
-                    ):
-                        continue
-                    unsupported = [
-                        value
-                        for value in values
-                        if not self._analysis_value_observed(value, kind)
-                    ]
-                    if not unsupported:
-                        continue
-                    issues.append(
-                        {
-                            "code": "analysis_claim_unavailable",
-                            "claim": f"{cell_text}: {cell}"[:200],
-                            "value": unsupported[0],
-                            "kind": kind,
-                            "message": (
-                                "No supporting analysis evidence (a completed "
-                                "backtest result or observed risk metric) exists "
-                                "for this figure. Mark the analysis as incomplete "
-                                "and omit these figures."
-                            ),
-                        }
-                    )
+                    self._check_table_cell(cell_text, kind, cell, issues)
         for index, line in enumerate(lines):
             if index in consumed:
                 continue
@@ -2814,6 +2808,61 @@ class GroundingLedger:
                     }
                 )
         return issues
+
+    def _check_table_cell(
+        self,
+        label: str,
+        kind: str | None,
+        cell: str,
+        issues: list[dict[str, Any]],
+    ) -> None:
+        """Reject one table cell whose numeric value is an unsupported metric.
+
+        Shared by the metric-headed and generic-header (label, value) table
+        paths. A forecast or definitional annotation exempts only that cell.
+
+        Args:
+            label: The metric label the value is attached to (header cell or
+                row's first cell), for the issue claim text.
+            kind: The resolved metric kind, already derived from ``label``.
+            cell: One value cell to validate.
+            issues: Accumulator for ``analysis_claim_unavailable`` issues.
+        """
+        if kind is None:
+            return
+        values = GroundingLedger._measure_numbers(cell)
+        if not values:
+            return
+        # A forecast annotation inside the cell ("预计 12.4%") exempts only
+        # that cell, never its neighbours.
+        if _FORECAST_FRAME_RE.search(cell) or _DEFINITION_FRAME_RE.search(cell):
+            return
+        # A comparison/criterion marker ("> 1.0", "小于 -5%", "以上")
+        # states a benchmark or bound, not an asserted observed value; the
+        # asserted-value gate is the wrong validator for a bound either way.
+        if _COMPARISON_CRITERION_RE.search(cell):
+            return
+        unsupported = [
+            value
+            for value in values
+            if not self._analysis_value_observed(value, kind)
+        ]
+        if not unsupported:
+            return
+        issues.append(
+            {
+                "code": "analysis_claim_unavailable",
+                "claim": f"{label}: {cell}"[:200],
+                "value": unsupported[0],
+                "kind": kind,
+                "message": (
+                    "No supporting analysis evidence (a completed "
+                    "backtest result or observed risk metric) exists "
+                    "for this figure. Mark the analysis as incomplete "
+                    "and omit these figures."
+                ),
+            }
+        )
 
     @staticmethod
     def _measure_numbers(text: str) -> list[str]:
